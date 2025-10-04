@@ -1,0 +1,7 @@
+title: "Heimwerkerbasis"
+description: "DIY-Projekte, Heimwerker-Tipps und Bauanleitungen für Haus und Garten"
+url: "https://heimwerkerbasis.de"
+theme: jekyll-theme-minimal
+plugins:
+  - jekyll-sitemap
+  - jekyll-seo-tag
