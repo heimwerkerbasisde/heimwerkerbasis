@@ -1,7 +1,29 @@
 title: "Heimwerkerbasis"
 description: "DIY-Projekte, Heimwerker-Tipps und Bauanleitungen für Haus und Garten"
 url: "https://heimwerkerbasis.de"
+author: "Heimwerkerbasis"
 theme: jekyll-theme-minimal
+
+# WICHTIG: Diese Plugins sind von GitHub Pages whitelisted
 plugins:
   - jekyll-sitemap
   - jekyll-seo-tag
+  - jekyll-feed
+
+# Basis-SEO
+permalink: /:title/
+timezone: Europe/Berlin
+markdown: kramdown
+
+# Navigation (wird auf der Startseite verlinkt)
+nav:
+  - title: "Blog"
+    url: "/"
+  - title: "Über"
+    url: "/about"
+  - title: "Kontakt"
+    url: "/contact"
+  - title: "Impressum"
+    url: "/impressum"
+  - title: "Datenschutz"
+    url: "/datenschutz"
