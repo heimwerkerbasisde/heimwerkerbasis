@@ -1,0 +1,11 @@
+/ (Repo-Wurzel)
+├─ _config.yml
+├─ index.md               # Startseite (Blog-Intro)
+├─ about.md               # Über mich/uns
+├─ contact.md             # Kontakt
+├─ impressum.md           # Impressum (DE-Pflicht)
+├─ datenschutz.md         # Datenschutz (DE-Pflicht, Basis)
+├─ robots.txt
+└─ assets/
+   └─ img/
+      └─ logo.png         # Platzhalter, optional
