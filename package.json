@@ -2,7 +2,9 @@
   "name": "avarra-api",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": "22.x"
+  },
   "dependencies": {
     "@trpc/server": "11.7.2",
     "axios": "^1.13.2",
