@@ -1186,12 +1186,13 @@ var ritualContentReason = (ritual) => {
 var diagnosticFromZod = (error) => error.issues.slice(0, 3).map((issue) => `${issue.path.join(".") || "root"}: ${issue.message}`).join("; ");
 var classifyRitualError = (error) => {
   const message = error instanceof Error ? error.message : String(error);
+  const upstream = error instanceof GroqHttpError ? error.body.replace(/Bearer\s+[^\s"']+/gi, "Bearer <redacted>").slice(0, 500) : "";
   const status = error instanceof GroqHttpError ? error.status : void 0;
   if (status === 401 || status === 403) return { ok: false, errorCode: "AUTH_ERROR", message: "Das Ritual ist momentan nicht verf\xFCgbar.", diagnostic: `Groq HTTP ${status}` };
   if (status === 429 || /rate limit|429/i.test(message)) return { ok: false, errorCode: "RATE_LIMIT", message: "Das Ritual ist momentan ausgelastet. Bitte erneut versuchen.", diagnostic: `Groq HTTP ${status ?? "429"}` };
   if (/abort|timeout|408|504/i.test(message)) return { ok: false, errorCode: "TIMEOUT", message: "Das Ritual antwortet zu langsam. Bitte erneut versuchen.", diagnostic: message.slice(0, 220) };
   if (status === 400 && /schema|json|failed_generation/i.test(message)) return { ok: false, errorCode: "SCHEMA_ERROR", message: "Das Ritual konnte nicht g\xFCltig vorbereitet werden.", diagnostic: message.slice(0, 300) };
-  return { ok: false, errorCode: "PROVIDER_ERROR", message: "Das Ritual ist momentan nicht verf\xFCgbar.", diagnostic: message.slice(0, 300) };
+  return { ok: false, errorCode: "PROVIDER_ERROR", message: "Das Ritual ist momentan nicht verf\xFCgbar.", diagnostic: `${message.slice(0, 220)}${upstream ? `; upstream=${upstream}` : ""}` };
 };
 async function requestStrictRitual(args) {
   try {
