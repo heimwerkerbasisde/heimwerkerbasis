@@ -47,6 +47,10 @@ var ENV = {
   forgeApiKey: process.env.BUILT_IN_FORGE_API_KEY ?? "",
   groqApiKey: process.env.GROQ_API_KEY ?? "",
   groqModel: process.env.GROQ_TEXT_MODEL ?? "openai/gpt-oss-120b",
+  mistralApiKey: process.env.MISTRAL_API_KEY ?? "",
+  mistralModel: process.env.MISTRAL_TEXT_MODEL ?? "mistral-small-2603",
+  openRouterApiKey: process.env.OPENROUTER_API_KEY ?? "",
+  openRouterModel: process.env.OPENROUTER_TEXT_MODEL ?? "openrouter/free",
   pollinationsApiKey: process.env.POLLINATIONS_API_KEY ?? "",
   pollinationsImageModel: process.env.POLLINATIONS_IMAGE_MODEL ?? "flux"
 };
@@ -708,13 +712,20 @@ var systemRouter = router({
 });
 
 // server/_core/llm.ts
-var GroqHttpError = class extends Error {
-  constructor(status, statusText, body, retryAfterSeconds) {
-    super(`Groq request failed (${status} ${statusText})`);
+var ProviderHttpError = class extends Error {
+  constructor(provider, status, statusText, body, retryAfterSeconds) {
+    super(`${provider} request failed (${status} ${statusText})`);
+    this.provider = provider;
     this.status = status;
     this.statusText = statusText;
     this.body = body;
     this.retryAfterSeconds = retryAfterSeconds;
+    this.name = "ProviderHttpError";
+  }
+};
+var GroqHttpError = class extends ProviderHttpError {
+  constructor(status, statusText, body, retryAfterSeconds) {
+    super("groq", status, statusText, body, retryAfterSeconds);
     this.name = "GroqHttpError";
   }
 };
@@ -724,33 +735,25 @@ var normalizeMessage = (message) => {
   return { role: message.role, content: message.content.text };
 };
 var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-var MAX_ATTEMPTS = 3;
 var REQUEST_TIMEOUT_MS = 45e3;
-async function fetchGroq(init) {
-  let lastError;
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-    try {
-      const response = await fetch("https://api.groq.com/openai/v1/chat/completions", { ...init, signal: controller.signal });
-      clearTimeout(timeout);
-      const retryable = response.status === 408 || response.status >= 500;
-      if (response.ok || !retryable || attempt === MAX_ATTEMPTS - 1) return { response, attempts: attempt + 1 };
-      const retryAfter = Number(response.headers.get("retry-after"));
-      const delay = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1e3 : 700 * 2 ** attempt;
-      await sleep(delay);
-    } catch (error) {
-      clearTimeout(timeout);
-      lastError = error;
-      if (attempt === MAX_ATTEMPTS - 1) throw error;
-      await sleep(700 * 2 ** attempt);
-    }
-  }
-  throw lastError instanceof Error ? lastError : new Error("Groq-Anfrage fehlgeschlagen");
+var FALLBACK_ATTEMPTS = 2;
+var providerConfig = {
+  groq: { endpoint: "https://api.groq.com/openai/v1/chat/completions", apiKey: ENV.groqApiKey, model: ENV.groqModel },
+  mistral: { endpoint: "https://api.mistral.ai/v1/chat/completions", apiKey: ENV.mistralApiKey, model: ENV.mistralModel },
+  openrouter: { endpoint: "https://openrouter.ai/api/v1/chat/completions", apiKey: ENV.openRouterApiKey, model: ENV.openRouterModel }
+};
+var headersFor = (provider, apiKey) => ({
+  "content-type": "application/json",
+  authorization: `Bearer ${apiKey}`,
+  ...provider === "openrouter" ? { "http-referer": "https://avarra-api.vercel.app", "x-title": "AVARRA" } : {}
+});
+function providerError(provider, response, body) {
+  return provider === "groq" ? new GroqHttpError(response.status, response.statusText, body, Number(response.headers.get("retry-after")) || void 0) : new ProviderHttpError(provider, response.status, response.statusText, body, Number(response.headers.get("retry-after")) || void 0);
 }
-async function invokeLLM(params) {
-  if (!ENV.groqApiKey) throw new Error("GROQ_API_KEY ist nicht konfiguriert");
-  const model = params.model ?? ENV.groqModel;
+async function invokeProvider(provider, params, attemptsLimit) {
+  const config = providerConfig[provider];
+  if (!config.apiKey) throw new Error(`${provider} API-Key ist nicht konfiguriert`);
+  const model = params.model ?? config.model;
   const payload = {
     model,
     messages: params.messages.map(normalizeMessage),
@@ -759,25 +762,59 @@ async function invokeLLM(params) {
     stream: false
   };
   if (params.responseFormat) payload.response_format = params.responseFormat;
-  const attempted = await fetchGroq({
-    method: "POST",
-    headers: { "content-type": "application/json", authorization: `Bearer ${ENV.groqApiKey}` },
-    body: JSON.stringify(payload)
-  });
-  const response = attempted.response;
-  const bodyText = await response.text();
-  if (!response.ok) throw new GroqHttpError(response.status, response.statusText, bodyText, Number(response.headers.get("retry-after")) || void 0);
-  let parsed;
-  try {
-    parsed = JSON.parse(bodyText);
-  } catch {
-    throw new Error("Groq lieferte keine parsebare JSON-Antwort");
+  let lastError;
+  for (let attempt = 0; attempt < attemptsLimit; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    try {
+      const response = await fetch(config.endpoint, { method: "POST", headers: headersFor(provider, config.apiKey), body: JSON.stringify(payload), signal: controller.signal });
+      clearTimeout(timeout);
+      const bodyText = await response.text();
+      if (!response.ok) {
+        const error = providerError(provider, response, bodyText);
+        const retryable = response.status === 408 || response.status === 429 || response.status >= 500;
+        if (retryable && attempt < attemptsLimit - 1) {
+          const retryAfter = error.retryAfterSeconds;
+          await sleep(Number.isFinite(retryAfter) && retryAfter && retryAfter > 0 ? Math.min(retryAfter * 1e3, 4e3) : 700 * 2 ** attempt);
+          continue;
+        }
+        throw error;
+      }
+      let parsed;
+      try {
+        parsed = JSON.parse(bodyText);
+      } catch {
+        throw new Error(`${provider} lieferte keine parsebare JSON-Antwort`);
+      }
+      const json = parsed;
+      if (json.error || !Array.isArray(json.choices) || !json.choices[0]?.message?.content) throw new Error(`${provider} lieferte keine vollst\xE4ndige Chat-Completions-Antwort`);
+      return { ...json, httpStatus: response.status, attempts: attempt + 1, provider };
+    } catch (error) {
+      clearTimeout(timeout);
+      lastError = error;
+      if (error instanceof ProviderHttpError && !(error.status === 408 || error.status === 429 || error.status >= 500)) throw error;
+      if (attempt === attemptsLimit - 1) throw error;
+      await sleep(700 * 2 ** attempt);
+    }
   }
-  const json = parsed;
-  if (json.error || !Array.isArray(json.choices) || !json.choices[0]?.message?.content) {
-    throw new Error("Groq lieferte keine vollst\xE4ndige Chat-Completions-Antwort");
+  throw lastError instanceof Error ? lastError : new Error(`${provider} Anfrage fehlgeschlagen`);
+}
+async function invokeTextWithFallback(params) {
+  const providers = ["groq", "mistral", "openrouter"];
+  let lastError;
+  for (const provider of providers) {
+    if (!providerConfig[provider].apiKey) continue;
+    try {
+      const result = await invokeProvider(provider, params, provider === "groq" ? 3 : FALLBACK_ATTEMPTS);
+      console.info("AVARRA_TEXT_PROVIDER_SELECTED", { provider, model: result.model, attempts: result.attempts });
+      return result;
+    } catch (error) {
+      lastError = error;
+      const status = error instanceof ProviderHttpError ? error.status : void 0;
+      console.warn("AVARRA_TEXT_PROVIDER_FALLBACK", { provider, status, reason: error instanceof Error ? error.message.slice(0, 180) : "unknown" });
+    }
   }
-  return { ...json, httpStatus: response.status, attempts: attempted.attempts };
+  throw lastError instanceof Error ? lastError : new Error("Kein Textprovider ist konfiguriert");
 }
 
 // server/storage.ts
@@ -981,6 +1018,103 @@ var publicMessageFor = (code) => {
   return messages[code];
 };
 
+// lib/avarra-final.ts
+var RITUAL_SITUATIONS = [
+  { scene: "Auf einer regennassen Br\xFCcke h\xE4lt ein Kind eine Laterne \xFCber das Wasser. Darunter treibt eine verschlossene Kiste gegen die Pfeiler.", dimension: "schutz", answers: ["Ich sichere zuerst das Kind und bitte dann um Hilfe.", "Ich untersuche die Kiste vom Ufer aus.", "Ich rufe die Br\xFCckenwache und bleibe sichtbar.", "Ich beobachte, wohin die Str\xF6mung die Kiste tr\xE4gt."] },
+  { scene: "In einem Gasthaus legt eine fremde Reisende einen Beutel mit fremden M\xFCnzen auf deinen Tisch. Sie behauptet, er geh\xF6re dir.", dimension: "integritaet", answers: ["Ich frage sie nach einem Beweis.", "Ich rufe die Wirtin dazu.", "Ich lege den Beutel unge\xF6ffnet zur\xFCck.", "Ich nehme die M\xFCnzen an und merke mir, was sie versucht."] },
+  { scene: "Ein alter Wegweiser dreht sich im Wind und zeigt gleichzeitig auf drei Wege. Aus einem Waldweg kommt ein leises Hornsignal.", dimension: "neugier", answers: ["Ich folge dem Hornsignal mit gezogenen Sinnen.", "Ich pr\xFCfe Spuren und Wind, bevor ich w\xE4hle.", "Ich suche einen erh\xF6hten Punkt f\xFCr \xDCberblick.", "Ich kehre zum letzten sicheren Ort zur\xFCck und frage nach."] },
+  { scene: "Vor dem Markttor wird eine Heilerin beschuldigt, eine seltene Zutat gestohlen zu haben. Die Menge wird ungeduldig.", dimension: "mut", answers: ["Ich bitte um Ruhe und h\xF6re beide Seiten an.", "Ich suche sofort nach dem fehlenden Beweis.", "Ich stelle mich zwischen Heilerin und Menge.", "Ich gehe der Spur der Zutat nach, ohne Partei zu ergreifen."] },
+  { scene: "Ein versiegelter Brief liegt in deinem Gep\xE4ck. Das Siegel tr\xE4gt das Zeichen eines Hauses, das du nicht kennst.", dimension: "wissen", answers: ["Ich suche jemanden, der das Siegel erkennt.", "Ich \xF6ffne den Brief an einem sicheren Ort.", "Ich bewahre ihn unge\xF6ffnet auf.", "Ich pr\xFCfe zuerst, wer Zugang zu meinem Gep\xE4ck hatte."] },
+  { scene: "Auf einem Fest verstummt die Musik, als eine maskierte Person deinen Namen nennt. Niemand sonst scheint die Stimme zu h\xF6ren.", dimension: "wahrnehmung", answers: ["Ich antworte laut und bitte um ein Zeichen.", "Ich folge der Person mit Abstand.", "Ich beobachte die Reaktionen der Umstehenden.", "Ich verlasse den Platz und pr\xFCfe, ob jemand folgt."] },
+  { scene: "Ein ersch\xF6pfter Bote bietet dir eine Abk\xFCrzung durch ein abgesperrtes Viertel an. Hinter den Barrikaden brennt noch Licht.", dimension: "risiko", answers: ["Ich frage nach dem Grund der Sperre.", "Ich suche einen legalen Weg hinein.", "Ich nehme die Abk\xFCrzung, aber plane den R\xFCckweg.", "Ich begleite den Boten zuerst zu einer Wache."] },
+  { scene: "In einer Werkstatt arbeitet ein Handwerker an einer Waffe, die bei jeder Ber\xFChrung eine andere Erinnerung zeigt.", dimension: "macht", answers: ["Ich bitte um eine Erkl\xE4rung, bevor ich sie ber\xFChre.", "Ich beobachte die Erinnerung und notiere Details.", "Ich lehne die Waffe ab, solange ihr Preis unklar ist.", "Ich frage, wem sie zuletzt geh\xF6rt hat."] },
+  { scene: "Eine freundliche Fremde l\xE4dt dich an ihren Tisch. W\xE4hrend sie lacht, z\xE4hlt sie unauff\xE4llig die Ausg\xE4nge des Raumes.", dimension: "menschenkenntnis", answers: ["Ich spreche ihre Beobachtung offen an.", "Ich setze mich so, dass ich beide T\xFCren sehe.", "Ich lasse sie reden und verrate nichts Wichtiges.", "Ich frage nach ihrem eigentlichen Auftrag."] },
+  { scene: "Ein verletztes Tier versperrt einen schmalen Pass. In der Ferne n\xE4hert sich ein Gewitter, und hinter dir wartet eine Karawane.", dimension: "prioritaet", answers: ["Ich helfe dem Tier und warne die Karawane.", "Ich suche einen sicheren Umweg.", "Ich bitte die Karawane um gemeinsames Anheben.", "Ich pr\xFCfe zuerst, ob das Tier eine Gefahr signalisiert."] },
+  { scene: "Ein Dorf bietet dir eine Belohnung f\xFCr eine einfache Wache an, verschweigt aber, warum seit drei N\xE4chten niemand schlafen kann.", dimension: "misstrauen", answers: ["Ich nehme an, stelle aber klare Fragen.", "Ich untersuche nachts die Umgebung.", "Ich lehne ab und warne die Bewohner.", "Ich verhandle eine Belohnung, die an Wahrheit gebunden ist."] },
+  { scene: "Eine Bronzeglocke schl\xE4gt mitten am Tag. Danach erinnert sich jede Person auf dem Platz an eine andere Version desselben Ereignisses.", dimension: "wahrheit", answers: ["Ich sammle die unterschiedlichen Erinnerungen.", "Ich suche die Glocke und ihre Mechanik.", "Ich halte mich zur\xFCck, bis die Verwirrung abklingt.", "Ich frage, wer von der Ver\xE4nderung profitiert."] },
+  { scene: "Ein reisender Kartograf zeigt dir eine wei\xDFe Stelle auf seiner Karte. Er bietet Wissen an, m\xF6chte daf\xFCr aber deinen Namen behalten.", dimension: "freiheit", answers: ["Ich biete eine andere Gegenleistung an.", "Ich frage, was er mit meinem Namen vorhat.", "Ich gebe nur einen Beinamen preis.", "Ich lehne ab und merke mir die Stelle."] },
+  { scene: "Ein Kind behauptet, die Schatten am Brunnen w\xFCrden nachts ihre Pl\xE4tze tauschen. Die Erwachsenen lachen dar\xFCber.", dimension: "empathie", answers: ["Ich nehme das Kind ernst und frage nach Einzelheiten.", "Ich beobachte den Brunnen bei Einbruch der Dunkelheit.", "Ich suche nach einer allt\xE4glichen Erkl\xE4rung.", "Ich bitte eine erwachsene Vertrauensperson hinzu."] },
+  { scene: "Ein verschlossener Schrein reagiert auf deine N\xE4he, obwohl du kein bekanntes Siegel tr\xE4gst. Aus dem Inneren kommt ein einzelner Atemzug.", dimension: "vorsicht", answers: ["Ich trete zur\xFCck und suche eine zust\xE4ndige Person.", "Ich untersuche die Umgebung nach einer Warnung.", "Ich spreche ruhig mit dem, was darin ist.", "Ich markiere den Ort und kehre sp\xE4ter zur\xFCck."] },
+  { scene: "Auf einem schmalen Marktweg zerrei\xDFt ein Windsto\xDF die Liste einer H\xE4ndlergilde. Mehrere Namen landen vor deinen F\xFC\xDFen.", dimension: "entscheidung", answers: ["Ich sammle alle Bl\xE4tter und suche den Besitzer.", "Ich lese nur, was offen sichtbar ist.", "Ich gebe die Bl\xE4tter einer neutralen Stelle.", "Ich merke mir einen Namen, bevor ich helfe."] },
+  { scene: "Eine junge Person bittet dich, eine harmlose L\xFCge zu best\xE4tigen, damit sie eine gef\xE4hrliche Verpflichtung nicht antreten muss.", dimension: "loyalitaet", answers: ["Ich frage, welche Gefahr dahintersteht.", "Ich verweigere die L\xFCge, biete aber einen Ausweg an.", "Ich best\xE4tige sie vorerst und kl\xE4re die Sache sp\xE4ter.", "Ich suche jemanden, der die Verpflichtung pr\xFCfen kann."] },
+  { scene: "Ein fremder Zauber l\xE4sst die Farben des Himmels verblassen. Eine Stimme verspricht, alles r\xFCckg\xE4ngig zu machen, wenn du ihr vertraust.", dimension: "vertrauen", answers: ["Ich verlange eine kleine \xFCberpr\xFCfbare Hilfe zuerst.", "Ich suche nach der Quelle des Zaubers.", "Ich warne die Menschen und bleibe bei ihnen.", "Ich stelle eine eigene Bedingung f\xFCr Vertrauen."] },
+  { scene: "Ein leerer Wagen steht quer auf der Stra\xDFe. Im Staub finden sich Spuren von drei verschiedenen Schuhen, aber keine Besitzer.", dimension: "ermittlung", answers: ["Ich sichere die Spuren und suche nach Zeugen.", "Ich folge der frischesten Spur.", "Ich warne Reisende und markiere den Wagen.", "Ich pr\xFCfe zuerst, ob die Ladung noch gef\xE4hrlich ist."] },
+  { scene: "Ein freundlicher Koch schenkt dir Essen und bittet dich danach, eine verschlossene T\xFCr in seinem Keller nicht zu \xF6ffnen.", dimension: "grenze", answers: ["Ich respektiere die Bitte und frage nach dem Grund.", "Ich biete Hilfe an, statt heimlich nachzusehen.", "Ich merke mir die T\xFCr und frage die Nachbarschaft.", "Ich lehne das Essen ab, bis die Bitte verst\xE4ndlich ist."] }
+];
+function ritualHash(seed, text2) {
+  let h = seed >>> 0;
+  for (const c of text2) h = h * 31 + c.charCodeAt(0) >>> 0;
+  return h >>> 0;
+}
+function validateRitualQuestion(q) {
+  const normalized = q.options.map((x) => x.trim().toLocaleLowerCase("de-DE"));
+  return q.situation.length >= 80 && q.options.length === 4 && normalized.every(Boolean) && new Set(normalized).size === 4 && !q.options.some((x) => /^(magier|krieger|dieb|heiler)\.?$/i.test(x));
+}
+function generateRitualInstance(seed) {
+  const used = /* @__PURE__ */ new Set();
+  const out = [];
+  let cursor = Math.abs(seed) % RITUAL_SITUATIONS.length;
+  while (out.length < 10 && used.size < RITUAL_SITUATIONS.length) {
+    cursor = (cursor * 17 + 11 + out.length * 7) % RITUAL_SITUATIONS.length;
+    if (used.has(cursor)) {
+      cursor = (cursor + 1) % RITUAL_SITUATIONS.length;
+      continue;
+    }
+    used.add(cursor);
+    const source = RITUAL_SITUATIONS[cursor];
+    const h = ritualHash(seed + out.length * 97, source.scene);
+    const shift = h % 4;
+    const options = source.answers.map((_, i) => source.answers[(i + shift) % 4]);
+    const question = { id: `ritual-${seed}-${out.length}`, situation: source.scene, text: source.scene, options, dimension: source.dimension, seed: h };
+    if (validateRitualQuestion(question)) out.push(question);
+  }
+  return out;
+}
+var LOCAL_RITUAL_TRAIT_MAP = {
+  schutz: "EMPATHY",
+  integritaet: "JUSTICE",
+  neugier: "CURIOSITY",
+  mut: "COURAGE",
+  wissen: "DISCIPLINE",
+  wahrnehmung: "CAUTION",
+  risiko: "AMBITION",
+  macht: "POWER_SEEKING",
+  menschenkenntnis: "CUNNING",
+  prioritaet: "PRAGMATISM",
+  misstrauen: "CAUTION",
+  wahrheit: "JUSTICE",
+  freiheit: "INDEPENDENCE",
+  empathie: "EMPATHY",
+  vorsicht: "CAUTION",
+  entscheidung: "PRAGMATISM",
+  loyalitaet: "LOYALTY",
+  vertrauen: "LOYALTY",
+  ermittlung: "CURIOSITY",
+  grenze: "DISCIPLINE"
+};
+var LOCAL_RITUAL_SECONDARY = ["COURAGE", "EMPATHY", "CURIOSITY", "DISCIPLINE", "AMBITION", "CAUTION", "INDEPENDENCE", "LOYALTY", "CUNNING", "PRAGMATISM", "JUSTICE", "POWER_SEEKING"];
+function generateLocalRitual(seed) {
+  const legacy = generateRitualInstance(seed);
+  const questions = legacy.map((question, questionIndex) => {
+    const primary = LOCAL_RITUAL_TRAIT_MAP[question.dimension] ?? "PRAGMATISM";
+    const prompt = `${question.situation} Was tust du zuerst, und worauf achtest du in diesem Augenblick?`;
+    const answers = question.options.map((text2, answerIndex) => {
+      const secondary = LOCAL_RITUAL_SECONDARY[(seed + questionIndex * 5 + answerIndex) % LOCAL_RITUAL_SECONDARY.length];
+      const primaryWeight = answerIndex === 0 ? 2 : answerIndex === 3 ? -1 : 1;
+      return {
+        id: `${question.id}-answer-${answerIndex}`,
+        text: text2,
+        signals: [
+          { trait: primary, weight: primaryWeight },
+          ...secondary === primary ? [] : [{ trait: secondary, weight: answerIndex % 2 === 0 ? 1 : -1 }]
+        ]
+      };
+    });
+    return { id: question.id, question: prompt, answers };
+  });
+  return { ritualId: `local-ritual-${Math.abs(seed)}`, questions };
+}
+
 // server/routers.ts
 import { z as z2 } from "zod";
 var GAME_MASTER_MODEL = ENV.groqModel;
@@ -1076,8 +1210,7 @@ var collectText = (response) => {
 async function requestStructured(args) {
   const startedAt = Date.now();
   try {
-    const response = await invokeLLM({
-      model: GAME_MASTER_MODEL,
+    const response = await invokeTextWithFallback({
       maxTokens: args.maxTokens,
       temperature: 0.35,
       responseFormat: jsonSchema(args.schemaName, args.schemaShape),
@@ -1088,21 +1221,22 @@ async function requestStructured(args) {
     try {
       decoded = JSON.parse(raw);
     } catch {
-      logRequest({ requestId: args.requestId, turnId: args.turnId, route: args.schemaName, provider: "groq", model: response.model, httpStatus: response.httpStatus, latencyMs: Date.now() - startedAt, retryCount: Math.max(0, response.attempts - 1), inputTokens: response.usage?.prompt_tokens, outputTokens: response.usage?.completion_tokens, errorCode: "INVALID_RESPONSE" });
+      logRequest({ requestId: args.requestId, turnId: args.turnId, route: args.schemaName, provider: response.provider ?? "groq", model: response.model, httpStatus: response.httpStatus, latencyMs: Date.now() - startedAt, retryCount: Math.max(0, response.attempts - 1), inputTokens: response.usage?.prompt_tokens, outputTokens: response.usage?.completion_tokens, errorCode: "INVALID_RESPONSE" });
       return { ok: false, errorCode: "INVALID_RESPONSE", message: publicMessageFor("INVALID_RESPONSE") };
     }
     const parsed = args.schema.safeParse(decoded);
     if (!parsed.success) {
-      logRequest({ requestId: args.requestId, turnId: args.turnId, route: args.schemaName, provider: "groq", model: response.model, httpStatus: response.httpStatus, latencyMs: Date.now() - startedAt, retryCount: Math.max(0, response.attempts - 1), inputTokens: response.usage?.prompt_tokens, outputTokens: response.usage?.completion_tokens, errorCode: "GROQ_SCHEMA_ERROR" });
+      logRequest({ requestId: args.requestId, turnId: args.turnId, route: args.schemaName, provider: response.provider ?? "groq", model: response.model, httpStatus: response.httpStatus, latencyMs: Date.now() - startedAt, retryCount: Math.max(0, response.attempts - 1), inputTokens: response.usage?.prompt_tokens, outputTokens: response.usage?.completion_tokens, errorCode: "GROQ_SCHEMA_ERROR" });
       return { ok: false, errorCode: "INVALID_RESPONSE", message: publicMessageFor("GROQ_SCHEMA_ERROR") };
     }
-    logRequest({ requestId: args.requestId, turnId: args.turnId, route: args.schemaName, provider: "groq", model: response.model, httpStatus: response.httpStatus, latencyMs: Date.now() - startedAt, retryCount: Math.max(0, response.attempts - 1), inputTokens: response.usage?.prompt_tokens, outputTokens: response.usage?.completion_tokens });
+    logRequest({ requestId: args.requestId, turnId: args.turnId, route: args.schemaName, provider: response.provider ?? "groq", model: response.model, httpStatus: response.httpStatus, latencyMs: Date.now() - startedAt, retryCount: Math.max(0, response.attempts - 1), inputTokens: response.usage?.prompt_tokens, outputTokens: response.usage?.completion_tokens });
     return { ok: true, value: parsed.data, model: response.model };
   } catch (error) {
-    const status = error instanceof GroqHttpError ? error.status : void 0;
+    const status = error instanceof ProviderHttpError ? error.status : void 0;
+    const provider = error instanceof ProviderHttpError ? error.provider : "groq";
     const message = error instanceof Error ? error.message : String(error);
     const code = status === 401 || status === 403 ? "GROQ_AUTH_ERROR" : status === 429 ? "GROQ_RATE_LIMIT" : /abort|timeout/i.test(message) ? "BACKEND_TIMEOUT" : "GROQ_PROVIDER_ERROR";
-    logRequest({ requestId: args.requestId, turnId: args.turnId, route: args.schemaName, provider: "groq", model: GAME_MASTER_MODEL, httpStatus: status, latencyMs: Date.now() - startedAt, retryCount: 0, errorCode: code });
+    logRequest({ requestId: args.requestId, turnId: args.turnId, route: args.schemaName, provider, model: GAME_MASTER_MODEL, httpStatus: status, latencyMs: Date.now() - startedAt, retryCount: 0, errorCode: code });
     return { ok: false, errorCode: code === "BACKEND_TIMEOUT" ? "TIMEOUT" : code === "GROQ_RATE_LIMIT" ? "INSUFFICIENT_QUOTA" : "CONNECTION_ERROR", message: publicMessageFor(code) };
   }
 }
@@ -1142,152 +1276,8 @@ var ritualAnswerJsonShape = {
   },
   required: ["id", "text", "signals"]
 };
-var ritualQuestionJsonShape = {
-  type: "object",
-  additionalProperties: false,
-  properties: {
-    id: { type: "string" },
-    question: { type: "string" },
-    // Groq reliably enforces object shape in strict mode, while array cardinality
-    // is validated in the technical Zod pass below. Keeping the decoder's array
-    // grammar unconstrained prevents a provider-side failed_generation response.
-    answers: { type: "array", items: ritualAnswerJsonShape }
-  },
-  required: ["id", "question", "answers"]
-};
-var ritualJsonShape = {
-  type: "object",
-  additionalProperties: false,
-  properties: {
-    ritualId: { type: "string" },
-    questions: { type: "array", items: ritualQuestionJsonShape }
-  },
-  required: ["ritualId", "questions"]
-};
 var oneRitualQuestionSchema = z2.object({ ritualId: z2.string().min(1).max(100), questions: z2.array(ritualQuestionSchema).length(1) });
-var ritualContentReason = (ritual) => {
-  const ritualIds = /* @__PURE__ */ new Set();
-  const questionTexts = /* @__PURE__ */ new Set();
-  for (const [questionIndex, question] of ritual.questions.entries()) {
-    const questionId = question.id.trim().toLocaleLowerCase("de-DE");
-    const questionText = question.question.trim().toLocaleLowerCase("de-DE");
-    if (!questionId) return `question[${questionIndex}].id leer`;
-    if (ritualIds.has(questionId)) return `question[${questionIndex}].id doppelt`;
-    if (questionTexts.has(questionText)) return `question[${questionIndex}].question doppelt`;
-    ritualIds.add(questionId);
-    questionTexts.add(questionText);
-    if (!/[a-zäöüß]/i.test(question.question) || /(klasse|klassenauswahl|wähle eine klasse)/i.test(question.question)) return `question[${questionIndex}] inhaltlich ungeeignet`;
-    const answerIds = /* @__PURE__ */ new Set();
-    const answerTexts = /* @__PURE__ */ new Set();
-    for (const [answerIndex, answer] of question.answers.entries()) {
-      const id = answer.id.trim().toLocaleLowerCase("de-DE");
-      const text2 = answer.text.trim().toLocaleLowerCase("de-DE");
-      if (!text2 || !/[a-zäöüß]/i.test(answer.text)) return `answer[${questionIndex}][${answerIndex}].text leer`;
-      if (answerIds.has(id)) return `answer[${questionIndex}][${answerIndex}].id doppelt`;
-      if (answerTexts.has(text2)) return `answer[${questionIndex}][${answerIndex}].text doppelt`;
-      if (/^\s*(magier|krieger|dieb|heiler|klasse)\s*$/i.test(answer.text)) return `answer[${questionIndex}][${answerIndex}] nennt eine Klasse`;
-      answerIds.add(id);
-      answerTexts.add(text2);
-    }
-  }
-  return null;
-};
 var diagnosticFromZod = (error) => error.issues.slice(0, 3).map((issue) => `${issue.path.join(".") || "root"}: ${issue.message}`).join("; ");
-var normalizeRitualDraft = (value) => {
-  const traitAliases = {
-    POWERSEEKING: "POWER_SEEKING",
-    POWER_SEEKING: "POWER_SEEKING"
-  };
-  if (!value || typeof value !== "object") return value;
-  const draft = value;
-  if (!Array.isArray(draft.questions)) return value;
-  return {
-    ...draft,
-    questions: draft.questions.map((question) => {
-      if (!question || typeof question !== "object") return question;
-      const q = question;
-      if (!Array.isArray(q.answers)) return question;
-      return {
-        ...question,
-        answers: q.answers.map((answer) => {
-          if (!answer || typeof answer !== "object") return answer;
-          const a = answer;
-          if (!Array.isArray(a.signals)) return answer;
-          return {
-            ...answer,
-            signals: a.signals.map((signal) => {
-              if (!signal || typeof signal !== "object") return signal;
-              const s = signal;
-              return {
-                ...signal,
-                trait: typeof s.trait === "string" ? traitAliases[s.trait.trim().toUpperCase().replace(/[ -]+/g, "_").replace(/_/g, "")] ?? s.trait.trim().toUpperCase().replace(/[ -]+/g, "_") : s.trait,
-                weight: typeof s.weight === "string" && /^[+-]?\d+$/.test(s.weight.trim()) ? Number(s.weight) : s.weight
-              };
-            })
-          };
-        })
-      };
-    })
-  };
-};
-var classifyRitualError = (error) => {
-  const message = error instanceof Error ? error.message : String(error);
-  const upstream = error instanceof GroqHttpError ? error.body.replace(/Bearer\s+[^\s"']+/gi, "Bearer <redacted>").slice(0, 500) : "";
-  const status = error instanceof GroqHttpError ? error.status : void 0;
-  if (status === 401 || status === 403) return { ok: false, errorCode: "AUTH_ERROR", message: "Das Ritual ist momentan nicht verf\xFCgbar.", diagnostic: `Groq HTTP ${status}` };
-  if (status === 429 || /rate limit|429/i.test(message)) return { ok: false, errorCode: "RATE_LIMIT", message: "Das Ritual ist momentan ausgelastet. Bitte erneut versuchen.", diagnostic: `Groq HTTP ${status ?? "429"}` };
-  if (/abort|timeout|408|504/i.test(message)) return { ok: false, errorCode: "TIMEOUT", message: "Das Ritual antwortet zu langsam. Bitte erneut versuchen.", diagnostic: message.slice(0, 220) };
-  if (status === 400 && /schema|json|failed_generation/i.test(message)) return { ok: false, errorCode: "SCHEMA_ERROR", message: "Das Ritual konnte nicht g\xFCltig vorbereitet werden.", diagnostic: message.slice(0, 300) };
-  return { ok: false, errorCode: "PROVIDER_ERROR", message: "Das Ritual ist momentan nicht verf\xFCgbar.", diagnostic: `${message.slice(0, 220)}${upstream ? `; upstream=${upstream}` : ""}` };
-};
-async function requestStrictRitual(args) {
-  try {
-    const response = await invokeLLM({
-      model: GAME_MASTER_MODEL,
-      maxTokens: args.maxTokens,
-      temperature: 0.2,
-      responseFormat: jsonSchema(args.schemaName, args.schemaShape),
-      messages: args.messages
-    });
-    const raw = collectText(response).trim();
-    logRequest({ requestId: args.requestId, route: `ritual:${args.label}`, provider: "groq", model: response.model, httpStatus: response.httpStatus ?? 200, latencyMs: 0, retryCount: Math.max(0, response.attempts - 1), inputTokens: response.usage?.prompt_tokens, outputTokens: response.usage?.completion_tokens });
-    if (!raw) {
-      console.warn("RITUAL_INVALID_JSON", { label: args.label, reason: "response body empty" });
-      return { ok: false, errorCode: "INVALID_JSON", message: "Das Ritual konnte nicht g\xFCltig vorbereitet werden.", diagnostic: "response body empty" };
-    }
-    let parsedJson;
-    try {
-      parsedJson = JSON.parse(raw);
-    } catch {
-      console.warn("RITUAL_INVALID_JSON", { label: args.label, reason: "JSON.parse failed", responseCharacters: raw.length });
-      return { ok: false, errorCode: "INVALID_JSON", message: "Das Ritual konnte nicht g\xFCltig vorbereitet werden.", diagnostic: "JSON.parse failed" };
-    }
-    const parsed = args.schema.safeParse(args.schemaName.startsWith("avarra_ritual") ? normalizeRitualDraft(parsedJson) : parsedJson);
-    if (!parsed.success) {
-      const reason = diagnosticFromZod(parsed.error);
-      console.warn("RITUAL_SCHEMA_FAILED", { label: args.label, reason });
-      return { ok: false, errorCode: "SCHEMA_ERROR", message: "Das Ritual konnte nicht g\xFCltig vorbereitet werden.", diagnostic: reason };
-    }
-    return { ok: true, value: parsed.data, model: response.model };
-  } catch (error) {
-    const failure = classifyRitualError(error);
-    logRequest({ requestId: args.requestId, route: `ritual:${args.label}`, provider: "groq", model: GAME_MASTER_MODEL, latencyMs: 0, retryCount: 0, errorCode: failure.errorCode === "AUTH_ERROR" ? "GROQ_AUTH_ERROR" : failure.errorCode === "RATE_LIMIT" ? "GROQ_RATE_LIMIT" : failure.errorCode === "TIMEOUT" ? "BACKEND_TIMEOUT" : failure.errorCode === "SCHEMA_ERROR" ? "GROQ_SCHEMA_ERROR" : "GROQ_PROVIDER_ERROR" });
-    return failure;
-  }
-}
-var ritualMessages = (input, purpose) => [
-  { role: "system", content: `AVARRA-RITUAL. Antworte ausschlie\xDFlich als JSON. Erzeuge genau 10 Fragen in "questions"; jede Frage hat genau 4 Antworten in "answers". Keine zus\xE4tzlichen Felder. Jede Frage: id, question, answers. Jede Antwort: id, text, signals. signals enth\xE4lt 1 bis 2 Objekte mit trait und weight. Nutze nur die erlaubten Traitnamen aus dem Schema. Schreibe kurze deutsche Fantasy-Situationen und kurze Antworten, damit alle 10 Fragen vollst\xE4ndig in die Antwort passen. Keine Klassen, R\xE4nge, Stats, Waffen, Meta-Begriffe oder Tests erw\xE4hnen. ${purpose === "repair" ? "Ersetze genau die fehlerhafte Frage." : purpose === "fresh" ? "Erzeuge vollst\xE4ndig neue Situationen." : "Vermeide die genannten recentThemes."}` },
-  { role: "user", content: JSON.stringify({ ritualSeed: input.ritualSeed, hiddenRarityBand: input.hiddenRarityBand, language: "de", recentThemes: input.recentThemes.slice(-4), output_contract: "EXACTLY_10_QUESTIONS_EXACTLY_4_ANSWERS_EACH" }) }
-];
-async function createValidatedRitual(input) {
-  const first = await requestStrictRitual({ label: "initial", requestId: input.requestId, schema: ritualSchema, schemaName: "avarra_ritual", schemaShape: ritualJsonShape, maxTokens: 5e3, messages: ritualMessages(input, "initial") });
-  if (first.ok) {
-    const contentReason = ritualContentReason(first.value);
-    if (!contentReason) return first;
-    return { ok: false, errorCode: "CONTENT_VALIDATION_ERROR", message: "Das Ritual konnte nicht sinnvoll vorbereitet werden. Bitte erneut versuchen.", diagnostic: contentReason };
-  }
-  return first;
-}
 var validateNarrative = (story) => story.narrative.length >= 40 && !/<[^>]+>|\b(DEBUG|PLAN|META|TODO)\b/i.test(story.narrative);
 var responseCache = /* @__PURE__ */ new Map();
 var CACHE_TTL_MS = 5 * 6e4;
@@ -1328,9 +1318,10 @@ var appRouter = router({
       const requestId = input.requestId ?? crypto.randomUUID();
       const cached = fromCache(`ritual:${requestId}`);
       if (cached) return cached;
-      const result = await createValidatedRitual({ ...input, requestId });
-      if (!result.ok) return result;
-      return remember(`ritual:${requestId}`, { ok: true, ritualId: result.value.ritualId, questions: result.value.questions, model: result.model });
+      const local = generateLocalRitual(input.ritualSeed);
+      const parsed = ritualSchema.safeParse(local);
+      if (!parsed.success) return { ok: false, errorCode: "CONTENT_VALIDATION_ERROR", message: "Das lokale Ritual konnte nicht g\xFCltig vorbereitet werden.", diagnostic: diagnosticFromZod(parsed.error) };
+      return remember(`ritual:${requestId}`, { ok: true, ritualId: parsed.data.ritualId, questions: parsed.data.questions, model: "local-ritual-v1" });
     }),
     generate: publicProcedure.input(z2.object({
       playerName: z2.string().min(1).max(40),
@@ -1351,7 +1342,7 @@ var appRouter = router({
       const turnId = input.turnId ?? crypto.randomUUID();
       const cached = fromCache(`story:${turnId}`);
       if (cached) return cached;
-      const systemPrompt = `Du bist der deutschsprachige AI Game Master des Fantasy-Text-RPGs Avarra, angetrieben von Groq.
+      const systemPrompt = `Du bist der deutschsprachige AI Game Master des Fantasy-Text-RPGs Avarra. Groq ist der bevorzugte Textprovider; Mistral und OpenRouter sind serverseitige Fallbacks.
 Du erz\xE4hlst lebendig, atmosph\xE4risch und konsequent. Die mobile App verwaltet Regeln, Savegame, Inventar und W20-Proben.
 Antworte ausschlie\xDFlich mit einem validen JSON-Objekt nach folgendem Format:
 {
@@ -1469,14 +1460,20 @@ async function createContext(opts) {
 var latest = {
   checkedAt: null,
   groqConfigured: false,
+  mistralConfigured: false,
+  openRouterConfigured: false,
   pollinationsConfigured: false,
   groqModel: ENV.groqModel,
+  mistralModel: ENV.mistralModel,
+  openRouterModel: ENV.openRouterModel,
   imageModel: ENV.pollinationsImageModel,
   groqModelVerified: null,
   imageModelVerified: null
 };
 async function verifyProviderHealth() {
   const groqConfigured = Boolean(ENV.groqApiKey);
+  const mistralConfigured = Boolean(ENV.mistralApiKey);
+  const openRouterConfigured = Boolean(ENV.openRouterApiKey);
   const pollinationsConfigured = Boolean(ENV.pollinationsApiKey);
   let groqModelVerified = null;
   let imageModelVerified = null;
@@ -1506,8 +1503,8 @@ async function verifyProviderHealth() {
       imageModelVerified = null;
     }
   }
-  latest = { checkedAt: (/* @__PURE__ */ new Date()).toISOString(), groqConfigured, pollinationsConfigured, groqModel: ENV.groqModel, imageModel: ENV.pollinationsImageModel, groqModelVerified, imageModelVerified };
-  console.info("AVARRA_PROVIDER_CONFIG", { groqConfigured, pollinationsConfigured, groqModel: ENV.groqModel, imageModel: ENV.pollinationsImageModel, groqModelVerified, imageModelVerified });
+  latest = { checkedAt: (/* @__PURE__ */ new Date()).toISOString(), groqConfigured, mistralConfigured, openRouterConfigured, pollinationsConfigured, groqModel: ENV.groqModel, mistralModel: ENV.mistralModel, openRouterModel: ENV.openRouterModel, imageModel: ENV.pollinationsImageModel, groqModelVerified, imageModelVerified };
+  console.info("AVARRA_PROVIDER_CONFIG", { groqConfigured, mistralConfigured, openRouterConfigured, pollinationsConfigured, groqModel: ENV.groqModel, mistralModel: ENV.mistralModel, openRouterModel: ENV.openRouterModel, imageModel: ENV.pollinationsImageModel, groqModelVerified, imageModelVerified });
   return latest;
 }
 
@@ -1597,9 +1594,12 @@ function createApp() {
       environment: ENV.isProduction ? "production" : "development",
       timestamp: (/* @__PURE__ */ new Date()).toISOString(),
       groqConfigured: health.groqConfigured,
+      mistralConfigured: health.mistralConfigured,
+      openRouterConfigured: health.openRouterConfigured,
       pollinationsConfigured: health.pollinationsConfigured,
       groqModel: health.groqModel,
       textModel: health.groqModel,
+      fallbackTextModels: { mistral: health.mistralModel, openRouter: health.openRouterModel },
       imageModel: health.imageModel,
       imageProvider: "pollinations",
       groqModelVerified: health.groqModelVerified,
