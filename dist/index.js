@@ -1138,7 +1138,7 @@ var ritualAnswerJsonShape = {
   properties: {
     id: { type: "string" },
     text: { type: "string" },
-    signals: { type: "array", minItems: 1, maxItems: 2, items: strictObject({ trait: { type: "string", enum: ["COURAGE", "EMPATHY", "CURIOSITY", "DISCIPLINE", "AMBITION", "CAUTION", "INDEPENDENCE", "LOYALTY", "CUNNING", "PRAGMATISM", "JUSTICE", "POWER_SEEKING"] }, weight: { type: "integer", enum: [-2, -1, 1, 2] } }) }
+    signals: { type: "array", items: strictObject({ trait: { type: "string" }, weight: { type: "integer" } }) }
   },
   required: ["id", "text", "signals"]
 };
