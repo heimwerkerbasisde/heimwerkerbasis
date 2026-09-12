@@ -1142,7 +1142,7 @@ var ritualQuestionJsonShape = {
     // Groq reliably enforces object shape in strict mode, while array cardinality
     // is validated in the technical Zod pass below. Keeping the decoder's array
     // grammar unconstrained prevents a provider-side failed_generation response.
-    answers: { type: "array", minItems: 4, maxItems: 4, items: ritualAnswerJsonShape }
+    answers: { type: "array", items: ritualAnswerJsonShape }
   },
   required: ["id", "question", "answers"]
 };
@@ -1151,7 +1151,7 @@ var ritualJsonShape = {
   additionalProperties: false,
   properties: {
     ritualId: { type: "string" },
-    questions: { type: "array", minItems: 10, maxItems: 10, items: ritualQuestionJsonShape }
+    questions: { type: "array", items: ritualQuestionJsonShape }
   },
   required: ["ritualId", "questions"]
 };
@@ -1234,7 +1234,7 @@ var ritualMessages = (input, purpose) => [
   { role: "user", content: JSON.stringify({ ritualSeed: input.ritualSeed, hiddenRarityBand: input.hiddenRarityBand, language: "de", recentThemes: input.recentThemes.slice(-4) }) }
 ];
 async function createValidatedRitual(input) {
-  const first = await requestStrictRitual({ label: "initial", requestId: input.requestId, schema: ritualSchema, schemaName: "avarra_ritual", schemaShape: ritualJsonShape, maxTokens: 3e3, messages: ritualMessages(input, "initial") });
+  const first = await requestStrictRitual({ label: "initial", requestId: input.requestId, schema: ritualSchema, schemaName: "avarra_ritual", schemaShape: ritualJsonShape, maxTokens: 5e3, messages: ritualMessages(input, "initial") });
   if (first.ok) {
     const contentReason = ritualContentReason(first.value);
     if (!contentReason) return first;
