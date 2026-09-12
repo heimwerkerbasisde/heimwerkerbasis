@@ -1193,6 +1193,43 @@ var ritualContentReason = (ritual) => {
   return null;
 };
 var diagnosticFromZod = (error) => error.issues.slice(0, 3).map((issue) => `${issue.path.join(".") || "root"}: ${issue.message}`).join("; ");
+var normalizeRitualDraft = (value) => {
+  const traitAliases = {
+    POWERSEEKING: "POWER_SEEKING",
+    POWER_SEEKING: "POWER_SEEKING"
+  };
+  if (!value || typeof value !== "object") return value;
+  const draft = value;
+  if (!Array.isArray(draft.questions)) return value;
+  return {
+    ...draft,
+    questions: draft.questions.map((question) => {
+      if (!question || typeof question !== "object") return question;
+      const q = question;
+      if (!Array.isArray(q.answers)) return question;
+      return {
+        ...question,
+        answers: q.answers.map((answer) => {
+          if (!answer || typeof answer !== "object") return answer;
+          const a = answer;
+          if (!Array.isArray(a.signals)) return answer;
+          return {
+            ...answer,
+            signals: a.signals.map((signal) => {
+              if (!signal || typeof signal !== "object") return signal;
+              const s = signal;
+              return {
+                ...signal,
+                trait: typeof s.trait === "string" ? traitAliases[s.trait.trim().toUpperCase().replace(/[ -]+/g, "_").replace(/_/g, "")] ?? s.trait.trim().toUpperCase().replace(/[ -]+/g, "_") : s.trait,
+                weight: typeof s.weight === "string" && /^[+-]?\d+$/.test(s.weight.trim()) ? Number(s.weight) : s.weight
+              };
+            })
+          };
+        })
+      };
+    })
+  };
+};
 var classifyRitualError = (error) => {
   const message = error instanceof Error ? error.message : String(error);
   const upstream = error instanceof GroqHttpError ? error.body.replace(/Bearer\s+[^\s"']+/gi, "Bearer <redacted>").slice(0, 500) : "";
@@ -1225,7 +1262,7 @@ async function requestStrictRitual(args) {
       console.warn("RITUAL_INVALID_JSON", { label: args.label, reason: "JSON.parse failed", responseCharacters: raw.length });
       return { ok: false, errorCode: "INVALID_JSON", message: "Das Ritual konnte nicht g\xFCltig vorbereitet werden.", diagnostic: "JSON.parse failed" };
     }
-    const parsed = args.schema.safeParse(parsedJson);
+    const parsed = args.schema.safeParse(args.schemaName.startsWith("avarra_ritual") ? normalizeRitualDraft(parsedJson) : parsedJson);
     if (!parsed.success) {
       const reason = diagnosticFromZod(parsed.error);
       console.warn("RITUAL_SCHEMA_FAILED", { label: args.label, reason });
