@@ -910,6 +910,7 @@ async function generateImage(options) {
       }
       const raw = Buffer.from(await response.arrayBuffer());
       let image = raw;
+      let imageContentType = contentType;
       if (!contentType.toLowerCase().startsWith("image/")) {
         try {
           const parsed = JSON.parse(raw.toString("utf8"));
@@ -919,14 +920,22 @@ async function generateImage(options) {
           const mediaContentType = mediaResponse.headers.get("content-type") ?? "";
           image = Buffer.from(await mediaResponse.arrayBuffer());
           if (!mediaResponse.ok || !mediaContentType.toLowerCase().startsWith("image/")) throw new Error(`media ${mediaResponse.status} ${mediaContentType}`);
+          imageContentType = mediaContentType;
         } catch {
           throw new PollinationsInvalidImageError(contentType, raw.byteLength, endpoint, model, Date.now() - requestStartedAt, attempt + 1, raw.toString("utf8").slice(0, 500));
         }
       }
-      if (image.byteLength < 1024 || !isPlausibleImage(image, contentType)) throw new PollinationsInvalidImageError(contentType, image.byteLength, endpoint, model, Date.now() - requestStartedAt, attempt + 1, "image header or size validation failed");
+      if (image.byteLength < 1024 || !isPlausibleImage(image, imageContentType)) throw new PollinationsInvalidImageError(imageContentType, image.byteLength, endpoint, model, Date.now() - requestStartedAt, attempt + 1, "image header or size validation failed");
       const imageId = `img-${Date.now().toString(36)}-${promptHash}`;
-      const stored = await storagePut(`pollinations/${imageId}.jpg`, image, contentType);
-      const result = { url: stored.url, source: "pollinations", imageId, attempts: attempt + 1, model };
+      let url;
+      try {
+        const stored = await storagePut(`pollinations/${imageId}.jpg`, image, imageContentType);
+        url = stored.url;
+      } catch (storageError) {
+        if (!(storageError instanceof Error) || !/storage config missing|forge|presign|s3/i.test(storageError.message)) throw storageError;
+        url = `data:${imageContentType || "image/jpeg"};base64,${image.toString("base64")}`;
+      }
+      const result = { url, source: "pollinations", imageId, attempts: attempt + 1, model };
       imageCache.set(promptHash, { response: result, expiresAt: Date.now() + 10 * 6e4 });
       return result;
     } catch (error) {
