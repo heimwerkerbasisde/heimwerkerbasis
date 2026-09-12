@@ -1,3 +1,4 @@
-import { createApp } from "../dist/index.js";
+import { createApp } from "../server/_core/index";
 
-export default createApp();
+const app = createApp();
+export default app;

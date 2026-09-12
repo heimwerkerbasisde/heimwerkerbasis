@@ -828,11 +828,29 @@ async function storagePut(relKey, data, contentType = "application/octet-stream"
 
 // server/_core/imageGeneration.ts
 var PollinationsHttpError = class extends Error {
-  constructor(status, body) {
+  constructor(status, body, contentType, endpoint, model, latencyMs, attempts) {
     super(`Pollinations request failed (${status})`);
     this.status = status;
     this.body = body;
+    this.contentType = contentType;
+    this.endpoint = endpoint;
+    this.model = model;
+    this.latencyMs = latencyMs;
+    this.attempts = attempts;
     this.name = "PollinationsHttpError";
+  }
+};
+var PollinationsInvalidImageError = class extends Error {
+  constructor(contentType, byteLength, endpoint, model, latencyMs, attempts, body) {
+    super("POLLINATIONS_INVALID_IMAGE");
+    this.contentType = contentType;
+    this.byteLength = byteLength;
+    this.endpoint = endpoint;
+    this.model = model;
+    this.latencyMs = latencyMs;
+    this.attempts = attempts;
+    this.body = body;
+    this.name = "PollinationsInvalidImageError";
   }
 };
 var imageCache = /* @__PURE__ */ new Map();
@@ -872,25 +890,40 @@ async function generateImage(options) {
   const endpoint = `https://gen.pollinations.ai/image/${encodeURIComponent(options.prompt)}?${query.toString()}`;
   let lastError;
   for (let attempt = 0; attempt < 3; attempt += 1) {
+    const requestStartedAt = Date.now();
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 75e3);
+    const timeout = setTimeout(() => controller.abort(), 6e4);
     try {
-      const response = await fetch(endpoint, { headers: { authorization: `Bearer ${ENV.pollinationsApiKey}`, accept: "image/*" }, signal: controller.signal });
+      const response = await fetch(endpoint, { headers: { authorization: `Bearer ${ENV.pollinationsApiKey}`, accept: "image/*, application/json", "user-agent": "AVARRA-Pollinations/1.0" }, signal: controller.signal });
       clearTimeout(timeout);
+      const contentType = response.headers.get("content-type") ?? "";
       if (!response.ok) {
-        const body = await response.text().catch(() => "");
-        const error = new PollinationsHttpError(response.status, body);
+        const body = (await response.text().catch(() => "")).slice(0, 500);
+        const error = new PollinationsHttpError(response.status, body, contentType, endpoint, model, Date.now() - requestStartedAt, attempt + 1);
         lastError = error;
-        const retryable = response.status === 429 || response.status >= 500;
+        const retryable = response.status === 429 || [502, 503, 504].includes(response.status);
         if (retryable && attempt < 2) {
           await sleep2(1e3 * 2 ** attempt);
           continue;
         }
         throw error;
       }
-      const contentType = response.headers.get("content-type") ?? "image/jpeg";
-      const image = Buffer.from(await response.arrayBuffer());
-      if (image.byteLength < 256 || !contentType.startsWith("image/")) throw new Error("POLLINATIONS_INVALID_IMAGE");
+      const raw = Buffer.from(await response.arrayBuffer());
+      let image = raw;
+      if (!contentType.toLowerCase().startsWith("image/")) {
+        try {
+          const parsed = JSON.parse(raw.toString("utf8"));
+          const remoteUrl = parsed.url ?? parsed.image_url;
+          if (!remoteUrl) throw new Error("missing image URL");
+          const mediaResponse = await fetch(remoteUrl, { headers: { accept: "image/*" }, signal: AbortSignal.timeout(6e4) });
+          const mediaContentType = mediaResponse.headers.get("content-type") ?? "";
+          image = Buffer.from(await mediaResponse.arrayBuffer());
+          if (!mediaResponse.ok || !mediaContentType.toLowerCase().startsWith("image/")) throw new Error(`media ${mediaResponse.status} ${mediaContentType}`);
+        } catch {
+          throw new PollinationsInvalidImageError(contentType, raw.byteLength, endpoint, model, Date.now() - requestStartedAt, attempt + 1, raw.toString("utf8").slice(0, 500));
+        }
+      }
+      if (image.byteLength < 1024 || !isPlausibleImage(image, contentType)) throw new PollinationsInvalidImageError(contentType, image.byteLength, endpoint, model, Date.now() - requestStartedAt, attempt + 1, "image header or size validation failed");
       const imageId = `img-${Date.now().toString(36)}-${promptHash}`;
       const stored = await storagePut(`pollinations/${imageId}.jpg`, image, contentType);
       const result = { url: stored.url, source: "pollinations", imageId, attempts: attempt + 1, model };
@@ -898,13 +931,19 @@ async function generateImage(options) {
       return result;
     } catch (error) {
       clearTimeout(timeout);
-      if (error instanceof PollinationsHttpError) throw error;
+      if (error instanceof PollinationsHttpError || error instanceof PollinationsInvalidImageError) throw error;
       lastError = error;
       if (attempt < 2) await sleep2(1e3 * 2 ** attempt);
     }
   }
   if (lastError instanceof Error && /abort|timeout/i.test(lastError.message)) throw new Error("POLLINATIONS_TIMEOUT");
   throw lastError instanceof Error ? lastError : new Error("POLLINATIONS_UNAVAILABLE");
+}
+function isPlausibleImage(image, contentType) {
+  if (contentType.toLowerCase().includes("jpeg") || contentType.toLowerCase().includes("jpg")) return image.subarray(0, 3).equals(Buffer.from([255, 216, 255]));
+  if (contentType.toLowerCase().includes("png")) return image.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+  if (contentType.toLowerCase().includes("webp")) return image.subarray(0, 4).toString("ascii") === "RIFF" && image.subarray(8, 12).toString("ascii") === "WEBP";
+  return image.byteLength >= 1024;
 }
 
 // server/_core/observability.ts
@@ -922,8 +961,11 @@ var publicMessageFor = (code) => {
     GROQ_SCHEMA_ERROR: "Der Game Master hat keine g\xFCltige Szene geliefert.",
     POLLINATIONS_AUTH_ERROR: "Die Pollinations-Bildverbindung ist nicht autorisiert.",
     POLLINATIONS_PAYMENT_REQUIRED: "Das Pollinations-Bildbudget ist momentan nicht ausreichend.",
+    POLLINATIONS_BUDGET_ERROR: "Das Pollinations-Bildbudget ist momentan nicht ausreichend.",
     POLLINATIONS_RATE_LIMIT: "Pollinations ist momentan ausgelastet. Bitte kurz warten.",
     POLLINATIONS_SERVER_ERROR: "Pollinations ist momentan nicht verf\xFCgbar.",
+    POLLINATIONS_PROVIDER_ERROR: "Pollinations ist momentan nicht verf\xFCgbar.",
+    POLLINATIONS_INVALID_IMAGE: "Pollinations hat kein g\xFCltiges Bild geliefert.",
     IMAGE_TIMEOUT: "Bildgenerierung dauert zu lange. Du kannst ohne Bild fortfahren.",
     INVALID_RESPONSE: "Der Game Master hat keine g\xFCltige Szene geliefert."
   };
@@ -999,18 +1041,12 @@ var storyTurnSchema = z2.object({
     reason: z2.string().min(1).max(300)
   }).nullable().catch(null)
 });
-var ritualTraitsSchema = z2.object({
-  courage: z2.number().int().min(-2).max(2),
-  empathy: z2.number().int().min(-2).max(2),
-  curiosity: z2.number().int().min(-2).max(2),
-  discipline: z2.number().int().min(-2).max(2),
-  ambition: z2.number().int().min(-2).max(2),
-  risk: z2.number().int().min(-2).max(2)
-});
+var ritualTraitSchema = z2.enum(["COURAGE", "EMPATHY", "CURIOSITY", "DISCIPLINE", "AMBITION", "CAUTION", "INDEPENDENCE", "LOYALTY", "CUNNING", "PRAGMATISM", "JUSTICE", "POWER_SEEKING"]);
+var ritualSignalSchema = z2.object({ trait: ritualTraitSchema, weight: z2.union([z2.literal(-2), z2.literal(-1), z2.literal(1), z2.literal(2)]) });
 var ritualAnswerSchema = z2.object({
   id: z2.string().min(1).max(80),
   text: z2.string().min(2).max(260),
-  traits: ritualTraitsSchema
+  signals: z2.array(ritualSignalSchema).min(1).max(2)
 });
 var ritualQuestionSchema = z2.object({
   id: z2.string().min(1).max(80),
@@ -1068,7 +1104,7 @@ var actionJsonShape = strictObject({ action_id: { type: "string" }, label: { typ
 var eventJsonShape = strictObject({ id: { type: "string" }, title: { type: "string" }, message: { type: "string" }, entityId: { type: "string" } });
 var npcJsonShape = strictObject({ npcId: { type: "string" }, name: { type: "string" }, agePresentation: { type: "string" }, role: { type: "string" }, personality: { type: "string" }, speechStyle: { type: "string" }, goals: stringArray(), fears: stringArray(), morality: { type: "string" }, faction: { type: "string" }, relationship: { type: "string" }, memories: stringArray() });
 var sceneJsonShape = strictObject({ location: { type: "string" }, time: { type: "string" }, weather: { type: "string" }, situation: { type: "string" } });
-var imageEventJsonShape = strictObject({ requested: { type: "boolean" }, moment: { type: "string" }, encounter: { type: "string" } });
+var imageEventJsonShape = strictObject({ requested: { type: "boolean" }, type: { type: "string", enum: ["NONE", "NPC_REVEAL", "BOSS_REVEAL", "MYTHIC_LOCATION", "MAJOR_DISCOVERY"] }, importance: { type: "number" }, reason: { type: "string" }, moment: { type: "string" }, encounter: { type: "string" } });
 var rollRequestJsonShape = strictObject({ required: { type: "boolean" }, stat: { type: "string", enum: ["STR", "AUS", "AGI", "MAG", "WIL", "GLK"] }, modifier: { type: "integer" }, dc: { type: "integer" }, risk: { type: "string", enum: ["niedrig", "mittel", "hoch"] }, reason: { type: "string" } });
 var storyJsonShape = strictObject({
   narrative: { type: "string" },
@@ -1093,19 +1129,7 @@ var ritualAnswerJsonShape = {
   properties: {
     id: { type: "string" },
     text: { type: "string" },
-    traits: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        courage: { type: "integer", minimum: -2, maximum: 2 },
-        empathy: { type: "integer", minimum: -2, maximum: 2 },
-        curiosity: { type: "integer", minimum: -2, maximum: 2 },
-        discipline: { type: "integer", minimum: -2, maximum: 2 },
-        ambition: { type: "integer", minimum: -2, maximum: 2 },
-        risk: { type: "integer", minimum: -2, maximum: 2 }
-      },
-      required: ["courage", "empathy", "curiosity", "discipline", "ambition", "risk"]
-    }
+    signals: { type: "array", minItems: 1, maxItems: 2, items: strictObject({ trait: { type: "string", enum: ["COURAGE", "EMPATHY", "CURIOSITY", "DISCIPLINE", "AMBITION", "CAUTION", "INDEPENDENCE", "LOYALTY", "CUNNING", "PRAGMATISM", "JUSTICE", "POWER_SEEKING"] }, weight: { type: "integer", enum: [-2, -1, 1, 2] } }) }
   },
   required: ["id", "text", "traits"]
 };
@@ -1128,15 +1152,6 @@ var ritualJsonShape = {
   properties: {
     ritualId: { type: "string" },
     questions: { type: "array", items: ritualQuestionJsonShape }
-  },
-  required: ["ritualId", "questions"]
-};
-var oneRitualQuestionJsonShape = {
-  type: "object",
-  additionalProperties: false,
-  properties: {
-    ritualId: { type: "string" },
-    questions: { type: "array", minItems: 1, maxItems: 1, items: ritualQuestionJsonShape }
   },
   required: ["ritualId", "questions"]
 };
@@ -1214,49 +1229,17 @@ async function requestStrictRitual(args) {
   }
 }
 var ritualMessages = (input, purpose) => [
-  {
-    role: "system",
-    content: `Du bist das Segnungsritual der Fantasy-Welt Avarra. Erstelle ein deutsches, klassennneutrales Pers\xF6nlichkeitsritual f\xFCr ${input.playerName}. Gib ausschlie\xDFlich das durch response_format erzwungene JSON zur\xFCck. Verbindlich: exakt 10 einzigartige Fragen, exakt 4 vollst\xE4ndige und unterschiedliche Antworten pro Frage, keine Klassenbezeichnungen, keine Meta-Kommentare. Jede Antwort braucht sechs kleine Integer-Traits von -2 bis +2. ${purpose === "repair" ? "Die letzte technische Ausgabe war unvollst\xE4ndig: pr\xFCfe insbesondere Anzahl der Fragen, Antworten und Traitfelder." : purpose === "fresh" ? "Erzeuge ein vollst\xE4ndig neues Ritual mit anderen Situationen." : "Jede Frage soll eine konkrete Fantasy-Entscheidungssituation beschreiben."}`
-  },
-  { role: "user", content: `Charaktername: ${input.playerName}; Geschlecht/Anrede: ${input.gender}; Ritualseed: ${input.seedHint}.` }
+  { role: "system", content: `Du erzeugst das g\xF6ttliche Klassenritual f\xFCr das Fantasy-RPG AVARRA. Deine einzige Aufgabe ist, exakt 10 neue deutsche Entscheidungsfragen zu erstellen, mit denen Pers\xF6nlichkeit, Instinkte, Werte und Probleml\xF6sungsweisen erfasst werden. Jede Frage ist eine konkrete, leicht verst\xE4ndliche Fantasy-Situation mit 25 bis 60 W\xF6rtern und endet mit einer nat\xFCrlichen Entscheidungsaufforderung. Die Fragen d\xFCrfen nicht wie Pers\xF6nlichkeitstests klingen und d\xFCrfen keine Klassen, R\xE4nge, Stats, Waffen, Magieschulen, R\xFCstungen, Kampfstile, Meta-Begriffe, Systeme oder Tests erw\xE4hnen. Jede Frage hat exakt vier glaubw\xFCrdige Handlungen mit 4 bis 18 W\xF6rtern; keine ist offensichtlich richtig oder falsch. Jede Antwort erh\xE4lt 1 bis 2 Signale aus COURAGE, EMPATHY, CURIOSITY, DISCIPLINE, AMBITION, CAUTION, INDEPENDENCE, LOYALTY, CUNNING, PRAGMATISM, JUSTICE, POWER_SEEKING mit Gewicht -2, -1, 1 oder 2. Mische Antwortpositionen und Situationen. Verrate niemals die Seltenheitsstufe, keine Prophezeiungen und keine Sonderbehandlung. Gib ausschlie\xDFlich JSON zur\xFCck. ${purpose === "repair" ? "Ersetze genau die fehlerhafte Frage und halte alle Mengenregeln ein." : purpose === "fresh" ? "Erzeuge vollst\xE4ndig neue Situationen." : "Vermeide die genannten recentThemes."}` },
+  { role: "user", content: JSON.stringify({ ritualSeed: input.ritualSeed, hiddenRarityBand: input.hiddenRarityBand, language: "de", recentThemes: input.recentThemes.slice(-4) }) }
 ];
-async function repairRitualContent(input, ritual) {
-  const reason = ritualContentReason(ritual);
-  if (!reason) return ritual;
-  const questionIndexMatch = reason.match(/(?:question|answer)\[(\d+)\]/);
-  const questionIndex = questionIndexMatch ? Number(questionIndexMatch[1]) : -1;
-  if (questionIndex < 0 || questionIndex >= ritual.questions.length) return null;
-  const failedQuestion = ritual.questions[questionIndex];
-  const repair = await requestStrictRitual({
-    label: `question-repair-${questionIndex}`,
-    requestId: input.requestId,
-    schema: oneRitualQuestionSchema,
-    schemaName: "avarra_ritual_question_repair",
-    schemaShape: oneRitualQuestionJsonShape,
-    maxTokens: 1300,
-    messages: [
-      { role: "system", content: "Ersetze genau eine fehlerhafte deutsche Fantasy-Ritualfrage. Gib exakt eine Frage mit exakt vier eindeutigen Antworten und vollst\xE4ndigen Traits zur\xFCck. Nenne keine Klassen und gib nur JSON aus." },
-      { role: "user", content: `Charakter: ${input.playerName}; Geschlecht: ${input.gender}; Fehler: ${reason}; zu ersetzende Frage: ${JSON.stringify(failedQuestion)}` }
-    ]
-  });
-  if (!repair.ok) return null;
-  const candidate = { ...ritual, questions: ritual.questions.map((question, index) => index === questionIndex ? repair.value.questions[0] : question) };
-  const after = ritualContentReason(candidate);
-  if (after) {
-    console.warn("RITUAL_CONTENT_REPAIR_FAILED", { reason: after, repairedIndex: questionIndex });
-    return null;
-  }
-  console.info("RITUAL_CONTENT_REPAIRED", { repairedIndex: questionIndex });
-  return candidate;
-}
 async function createValidatedRitual(input) {
-  const first = await requestStrictRitual({ label: "initial", requestId: input.requestId, schema: ritualSchema, schemaName: "avarra_ritual", schemaShape: ritualJsonShape, maxTokens: 6500, messages: ritualMessages(input, "initial") });
+  const first = await requestStrictRitual({ label: "initial", requestId: input.requestId, schema: ritualSchema, schemaName: "avarra_ritual", schemaShape: ritualJsonShape, maxTokens: 3e3, messages: ritualMessages(input, "initial") });
   if (first.ok) {
-    const repaired = await repairRitualContent(input, first.value);
-    if (repaired) return { ok: true, value: repaired, model: first.model };
+    const contentReason = ritualContentReason(first.value);
+    if (!contentReason) return first;
+    return { ok: false, errorCode: "CONTENT_VALIDATION_ERROR", message: "Das Ritual konnte nicht sinnvoll vorbereitet werden. Bitte erneut versuchen.", diagnostic: contentReason };
   }
-  if (!first.ok) return first;
-  return { ok: false, errorCode: "CONTENT_VALIDATION_ERROR", message: "Das Ritual konnte nicht sinnvoll vorbereitet werden. Bitte erneut versuchen.", diagnostic: ritualContentReason(first.value) ?? "content validation failed" };
+  return first;
 }
 var validateNarrative = (story) => story.narrative.length >= 40 && !/<[^>]+>|\b(DEBUG|PLAN|META|TODO)\b/i.test(story.narrative);
 var responseCache = /* @__PURE__ */ new Map();
@@ -1294,7 +1277,7 @@ var appRouter = router({
     })
   }),
   game: router({
-    ritual: publicProcedure.input(z2.object({ playerName: z2.string().min(1).max(40), gender: z2.string().max(30), seedHint: z2.number().int(), requestId: z2.string().min(8).max(120).optional() })).mutation(async ({ input }) => {
+    ritual: publicProcedure.input(z2.object({ ritualSeed: z2.number().int(), hiddenRarityBand: z2.enum(["NORMAL", "UNUSUAL", "RARE", "LEGENDARY", "SSSS"]), recentThemes: z2.array(z2.string().max(80)).max(4).default([]), requestId: z2.string().min(8).max(120).optional() })).mutation(async ({ input }) => {
       const requestId = input.requestId ?? crypto.randomUUID();
       const cached = fromCache(`ritual:${requestId}`);
       if (cached) return cached;
@@ -1338,11 +1321,11 @@ Antworte ausschlie\xDFlich mit einem validen JSON-Objekt nach folgendem Format:
   "inventoryEvents": [],
   "progressionEvents": [],
   "codexEvents": [],
-  "imageEvent": { "requested": false, "moment": "", "encounter": "" },
+  "imageEvent": { "requested": false, "type": "NONE", "importance": 0, "reason": "", "moment": "", "encounter": "" },
   "rollRequest": null
 }
 Wenn eine W20-Information \xFCbergeben wurde, beschreibe deren Konsequenz direkt in narrative und setze rollRequest auf null.
-imageEvent.requested wird nur bei echten H\xF6hepunkten wahr (z.B. schwerer Kampf, Ankunft an mythologischem Ort).`;
+imageEvent.requested wird nur bei echten H\xF6hepunkten wahr (z.B. schwerer Kampf, Ankunft an mythologischem Ort). Setze type auf NONE und importance auf 0, wenn kein Bild begr\xFCndet ist. requested=true ist nur mit importance >= 0.8 und einer konkreten reason erlaubt.`;
       const result = await requestStructured({
         schema: storyTurnSchema,
         schemaName: "avarra_story_turn",
@@ -1410,8 +1393,10 @@ Keine vollst\xE4ndige Klassenliste, keine komplette Chronik und keine unbest\xE4
       } catch (error) {
         const status = error instanceof PollinationsHttpError ? error.status : void 0;
         const message = error instanceof Error ? error.message : String(error);
-        const code = status === 401 || status === 403 ? "POLLINATIONS_AUTH_ERROR" : status === 402 ? "POLLINATIONS_PAYMENT_REQUIRED" : status === 429 ? "POLLINATIONS_RATE_LIMIT" : /timeout|abort/i.test(message) ? "IMAGE_TIMEOUT" : "POLLINATIONS_SERVER_ERROR";
-        logRequest({ requestId, turnId: eventId, route: "generateImage", provider: "backend", model: ENV.pollinationsImageModel, httpStatus: status, latencyMs: Date.now() - startedAt, retryCount: 0, errorCode: code });
+        const code = error instanceof PollinationsInvalidImageError ? "POLLINATIONS_INVALID_IMAGE" : status === 401 || status === 403 ? "POLLINATIONS_AUTH_ERROR" : status === 402 ? "POLLINATIONS_BUDGET_ERROR" : status === 429 ? "POLLINATIONS_RATE_LIMIT" : status !== void 0 && status >= 500 ? "POLLINATIONS_PROVIDER_ERROR" : /timeout|abort/i.test(message) ? "IMAGE_TIMEOUT" : "POLLINATIONS_SERVER_ERROR";
+        const details = error instanceof PollinationsHttpError || error instanceof PollinationsInvalidImageError ? { endpoint: error.endpoint, contentType: error instanceof PollinationsHttpError ? error.contentType : error.contentType, upstreamBody: error.body.slice(0, 500), upstreamLatencyMs: error.latencyMs, upstreamAttempts: error.attempts } : void 0;
+        console.warn("POLLINATIONS_DIAGNOSTIC", { requestId, model: ENV.pollinationsImageModel, status, message, ...details });
+        logRequest({ requestId, turnId: eventId, route: "generateImage", provider: "backend", model: ENV.pollinationsImageModel, httpStatus: status, latencyMs: Date.now() - startedAt, retryCount: details?.upstreamAttempts ? Math.max(0, details.upstreamAttempts - 1) : 0, errorCode: code });
         return { ok: false, status: code, message: publicMessageFor(code), url: null };
       }
     })
