@@ -1200,7 +1200,7 @@ async function requestStrictRitual(args) {
       model: GAME_MASTER_MODEL,
       maxTokens: args.maxTokens,
       temperature: 0.2,
-      responseFormat: jsonSchema(args.schemaName, args.schemaShape),
+      responseFormat: args.schemaName.startsWith("avarra_ritual") ? { type: "json_object" } : jsonSchema(args.schemaName, args.schemaShape),
       messages: args.messages
     });
     const raw = collectText(response).trim();
