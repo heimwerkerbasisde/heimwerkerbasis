@@ -1142,7 +1142,7 @@ var ritualQuestionJsonShape = {
     // Groq reliably enforces object shape in strict mode, while array cardinality
     // is validated in the technical Zod pass below. Keeping the decoder's array
     // grammar unconstrained prevents a provider-side failed_generation response.
-    answers: { type: "array", items: ritualAnswerJsonShape }
+    answers: { type: "array", minItems: 4, maxItems: 4, items: ritualAnswerJsonShape }
   },
   required: ["id", "question", "answers"]
 };
@@ -1151,7 +1151,7 @@ var ritualJsonShape = {
   additionalProperties: false,
   properties: {
     ritualId: { type: "string" },
-    questions: { type: "array", items: ritualQuestionJsonShape }
+    questions: { type: "array", minItems: 10, maxItems: 10, items: ritualQuestionJsonShape }
   },
   required: ["ritualId", "questions"]
 };
